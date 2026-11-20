@@ -323,3 +323,8 @@ else:
 
 st.divider()
 st.caption("研究工具，不构成投资建议。仅在打开网页并点击按钮时扫描；无后台运行、无推送、无自动交易。")
+
+
+# Call position management (same authenticated session / Supabase credentials)
+from call_positions import render_call_positions
+render_call_positions(SUPABASE_URL, SUPABASE_KEY)
