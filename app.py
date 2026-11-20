@@ -5,12 +5,44 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
+import requests
+import hmac
+import re
 
 DEFAULT_TICKERS = ["AAPL", "AMZN", "ASML", "AXP", "COST", "DIS", "GLD", "GOOGL", "IBIT", "JNJ", "JPM", "MCD", "META", "MSFT", "NFLX", "PDD", "TSLA", "V", "WMT"]
 ET = ZoneInfo("America/New_York")
 
 st.set_page_config(page_title="BB12 信号监控", page_icon="📈", layout="wide")
 st.title("📈 BB12 · 股票信号监控")
+
+# Password gate protects the public Streamlit app. Do not put secrets in GitHub.
+try:
+    CONFIG = st.secrets["supabase"]
+    SUPABASE_URL = str(CONFIG["url"]).rstrip("/")
+    SUPABASE_KEY = str(CONFIG["service_role_key"])
+    APP_PASSWORD = str(st.secrets["app_password"])
+    if not (SUPABASE_URL.startswith("https://") and SUPABASE_KEY and APP_PASSWORD):
+        raise ValueError("配置值为空或URL不是https")
+except Exception:
+    st.error("尚未配置Supabase和访问密码。请按部署说明在Streamlit Secrets中填写。")
+    st.stop()
+
+if not st.session_state.get("authenticated", False):
+    with st.form("login"):
+        password = st.text_input("访问密码", type="password")
+        submitted = st.form_submit_button("进入BB12")
+    if submitted:
+        if hmac.compare_digest(password, APP_PASSWORD):
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("访问密码错误")
+    st.stop()
+
+if st.button("退出登录"):
+    st.session_state.clear()
+    st.rerun()
+
 st.caption("自定义股票池｜12周布林带｜Yahoo Finance 日线｜只发出候选信号，不连接券商、不下单")
 
 with st.expander("信号定义与重要说明", expanded=False):
@@ -69,49 +101,98 @@ def calculate(prices: pd.DataFrame) -> dict:
     }
 
 
-import re
-
 MAX_TICKERS = 60
 
+
 def normalize_ticker(raw: str) -> str:
-    """Simple Yahoo symbol validation; prevents malformed input."""
     symbol = raw.strip().upper()
     if not re.fullmatch(r"[A-Z0-9^][A-Z0-9.^=-]{0,19}", symbol):
-        raise ValueError("股票代码只能包含字母、数字、点、横杠、^ 或 =，最多20字符")
+        raise ValueError("股票代码格式错误（只允许字母、数字、点、横杠、^、=）")
     return symbol
 
 
 def parse_tickers(raw: str) -> list[str]:
-    items = re.split(r"[,，;；\s]+", raw.strip())
     tickers = []
-    for item in items:
+    for item in re.split(r"[,，;；\s]+", raw.strip()):
         if item:
-            ticker = normalize_ticker(item)
-            if ticker not in tickers:
-                tickers.append(ticker)
+            symbol = normalize_ticker(item)
+            if symbol not in tickers:
+                tickers.append(symbol)
     if len(tickers) > MAX_TICKERS:
         raise ValueError(f"最多监控{MAX_TICKERS}只股票")
     return tickers
 
 
-# Watchlist in URL parameters: survives refresh when using the saved URL.
-# Cloud disk/session_state alone would not persist reliably across iPhone visits.
-if "watchlist" not in st.session_state:
-    saved = st.query_params.get("symbols", "")
-    try:
-        st.session_state.watchlist = parse_tickers(saved) if saved else DEFAULT_TICKERS.copy()
-    except ValueError:
-        st.session_state.watchlist = DEFAULT_TICKERS.copy()
-        st.warning("网址中的股票代码无效，已恢复默认列表。")
+def db_request(method: str, *, params=None, payload=None):
+    url = f"{SUPABASE_URL}/rest/v1/bb12_watchlists"
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Prefer": "return=representation",
+    }
+    response = requests.request(method, url, headers=headers, params=params,
+                                json=payload, timeout=15)
+    response.raise_for_status()
+    return response.json()
 
-def persist_watchlist():
-    st.query_params["symbols"] = ",".join(st.session_state.watchlist)
+
+def load_watchlist():
+    rows = db_request("GET", params={"id": "eq.1", "select": "tickers,revision"})
+    if len(rows) != 1:
+        raise RuntimeError("数据库中缺少id=1的股票池记录，请执行SQL初始化脚本")
+    raw = rows[0]["tickers"]
+    if not isinstance(raw, list):
+        raise ValueError("数据库股票池格式不正确")
+    tickers = parse_tickers(",".join(raw))
+    return tickers, int(rows[0]["revision"])
+
+
+def save_watchlist(tickers, expected_revision):
+    if len(tickers) > MAX_TICKERS or len(tickers) != len(set(tickers)):
+        raise ValueError("股票池无效")
+    rows = db_request("PATCH", params={"id": "eq.1", "revision": f"eq.{expected_revision}"},
+                      payload={"tickers": tickers, "revision": expected_revision + 1})
+    if len(rows) != 1:
+        raise RuntimeError("另一台设备已修改股票池。请点击‘从云端刷新’，再重新操作。")
+    return expected_revision + 1
+
+
+def refresh_cloud():
+    tickers, revision = load_watchlist()
+    st.session_state.watchlist = tickers
+    st.session_state.revision = revision
     st.session_state.pop("result", None)
     st.session_state.pop("errors", None)
 
 
+def commit_watchlist(next_tickers):
+    next_revision = save_watchlist(next_tickers, st.session_state.revision)
+    st.session_state.watchlist = next_tickers
+    st.session_state.revision = next_revision
+    st.session_state.pop("result", None)
+    st.session_state.pop("errors", None)
+
+
+# Read cloud on every full page load. During interactive reruns keep local state
+# to avoid discarding a form action; the refresh button explicitly re-syncs.
+if "watchlist" not in st.session_state:
+    try:
+        refresh_cloud()
+    except Exception as exc:
+        st.error(f"无法读取云端股票池：{exc}")
+        st.stop()
+
 st.subheader(f"📋 我的监控股票（{len(st.session_state.watchlist)}只）")
-st.caption("可自行添加、移除或恢复默认股票。股票池写入当前网页地址；请保存更新后的网址，供以后从iPhone重新打开。")
+st.caption("☁️ 股票池保存在Supabase；添加、删除会立即写入云端。电脑与iPhone使用同一个访问密码。")
+if st.button("🔄 从云端刷新股票池"):
+    try:
+        refresh_cloud()
+        st.rerun()
+    except Exception as exc:
+        st.error(f"刷新失败：{exc}")
+
 with st.form("add_ticker", clear_on_submit=True):
     add_raw = st.text_input("添加股票代码", placeholder="例如 NVDA，或 NVDA, AMD, KO")
     add_clicked = st.form_submit_button("➕ 添加股票")
@@ -119,40 +200,44 @@ if add_clicked:
     try:
         incoming = parse_tickers(add_raw)
         if not incoming:
-            st.warning("请先输入股票代码。")
+            st.warning("请输入股票代码")
         else:
             merged = st.session_state.watchlist + [x for x in incoming if x not in st.session_state.watchlist]
             if len(merged) > MAX_TICKERS:
-                st.error(f"股票池最多{MAX_TICKERS}只，请先移除部分股票。")
+                st.error(f"股票池最多{MAX_TICKERS}只")
+            elif merged == st.session_state.watchlist:
+                st.info("股票已在观察池中")
             else:
-                st.session_state.watchlist = merged
-                persist_watchlist()
+                commit_watchlist(merged)
                 st.rerun()
-    except ValueError as exc:
-        st.error(str(exc))
+    except Exception as exc:
+        st.error(f"保存失败，原列表未修改：{exc}")
 
 with st.expander("管理 / 移除股票", expanded=False):
     to_remove = st.multiselect("选择要移除的代码", st.session_state.watchlist)
     a, b = st.columns(2)
     if a.button("移除所选", disabled=not to_remove, use_container_width=True):
-        st.session_state.watchlist = [x for x in st.session_state.watchlist if x not in to_remove]
-        persist_watchlist()
-        st.rerun()
+        try:
+            commit_watchlist([x for x in st.session_state.watchlist if x not in to_remove])
+            st.rerun()
+        except Exception as exc:
+            st.error(f"保存失败：{exc}")
     if b.button("恢复默认19只", use_container_width=True):
-        st.session_state.watchlist = DEFAULT_TICKERS.copy()
-        persist_watchlist()
-        st.rerun()
+        try:
+            commit_watchlist(DEFAULT_TICKERS.copy())
+            st.rerun()
+        except Exception as exc:
+            st.error(f"保存失败：{exc}")
     st.code(", ".join(st.session_state.watchlist) or "（空）", language=None)
     st.download_button("⬇️ 备份股票清单", "\n".join(st.session_state.watchlist) + "\n",
                        file_name="bb12_watchlist.txt", mime="text/plain")
-    uploaded = st.file_uploader("从TXT文件恢复股票清单（每行一个代码）", type=["txt"])
+    uploaded = st.file_uploader("从TXT恢复股票清单（每行一个代码）", type=["txt"])
     if uploaded is not None and st.button("导入并替换当前清单"):
         try:
             new_list = parse_tickers(uploaded.getvalue().decode("utf-8-sig"))
-            st.session_state.watchlist = new_list
-            persist_watchlist()
+            commit_watchlist(new_list)
             st.rerun()
-        except (UnicodeDecodeError, ValueError) as exc:
+        except Exception as exc:
             st.error(f"导入失败：{exc}")
 
 if not st.session_state.watchlist:
